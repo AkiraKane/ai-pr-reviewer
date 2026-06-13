@@ -1,0 +1,23 @@
+name: 'AI PR Reviewer'
+description: 'Review PRs using AI and post comments'
+inputs:
+  pr_number:
+    description: 'PR number to review'
+    required: true
+  ollama_url:
+    description: 'Ollama API URL'
+    required: false
+    default: 'http://localhost:11434'
+  model:
+    description: 'Ollama model to use'
+    required: false
+    default: 'llama3.2'
+runs:
+  using: 'composite'
+  steps:
+    - name: Review PR
+      shell: bash
+      env:
+        OPENAI_API_KEY: ${{ inputs.openai_api_key }}
+      run: |
+        python src/main.py ${{ inputs.pr_number }} --comment --ollama-url ${{ inputs.ollama_url }} --model ${{ inputs.model }}

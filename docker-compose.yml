@@ -1,0 +1,9 @@
+services:
+  reviewer:
+    build: .
+    volumes:
+      - .:/app/repo
+      - ~/.config/gh:/root/.config/gh:ro
+    environment:
+      - OLLAMA_URL=http://host.docker.internal:11434
+    command: python main.py 1 --repo /app/repo
