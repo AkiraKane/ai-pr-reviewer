@@ -2,6 +2,7 @@
 """AI PR Reviewer — review PRs using AI and post comments to GitHub."""
 
 import argparse
+import json
 import subprocess
 import sys
 import os
@@ -18,6 +19,9 @@ def main():
 Examples:
   %(prog)s 123                        # Review PR #123
   %(prog)s 123 --comment              # Review and post comment
+  %(prog)s 123 --agent                # Multi-file agent review
+  %(prog)s 123 --agent --inline       # Agent review with inline comments
+  %(prog)s 123 --agent --inline --watch  # CI mode: exit 1 on critical issues
   %(prog)s --unstaged                 # Review unstaged changes
   %(prog)s --staged                   # Review staged changes
   %(prog)s --pr 123 --output json    # Output review as JSON
@@ -31,6 +35,12 @@ Examples:
                         help="Review staged changes")
     parser.add_argument("--comment", action="store_true",
                         help="Post review as PR comment")
+    parser.add_argument("--agent", action="store_true",
+                        help="Multi-file agent review with cross-referencing")
+    parser.add_argument("--inline", action="store_true",
+                        help="Post inline review comments (requires --agent)")
+    parser.add_argument("--watch", action="store_true",
+                        help="Exit with non-zero code if critical issues found (for CI)")
     parser.add_argument("--output", choices=["markdown", "json"],
                         default="markdown", help="Output format")
     parser.add_argument("--ollama-url", default="http://localhost:11434",
@@ -46,6 +56,32 @@ Examples:
     if not args.pr and not args.unstaged and not args.staged:
         parser.error("Must specify PR number, --unstaged, or --staged")
 
+    if args.inline and not args.agent:
+        parser.error("--inline requires --agent mode")
+
+    if args.watch and not args.agent:
+        parser.error("--watch requires --agent mode")
+
+    # Check Ollama
+    if not check_ollama(args.ollama_url):
+        if not os.environ.get("OPENAI_API_KEY"):
+            print("Error: Neither Ollama nor OPENAI_API_KEY available.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    # Agent mode (PR only)
+    if args.agent:
+        if not args.pr:
+            parser.error("--agent mode requires a PR number")
+        _run_agent_mode(args)
+        return
+
+    # Standard mode
+    _run_standard_mode(args)
+
+
+def _run_standard_mode(args):
+    """Run the standard (non-agent) review flow."""
     # Get diff
     if args.unstaged:
         diff = get_unstaged_diff(args.repo)
@@ -69,13 +105,6 @@ Examples:
         print(f"Files: {pr_diff.file_count}, +{pr_diff.total_additions} -{pr_diff.total_deletions}")
         print()
 
-    # Check Ollama
-    if not check_ollama(args.ollama_url):
-        if not os.environ.get("OPENAI_API_KEY"):
-            print("Error: Neither Ollama nor OPENAI_API_KEY available.",
-                  file=sys.stderr)
-            sys.exit(1)
-
     # Generate review
     print("Generating review...")
     try:
@@ -86,7 +115,6 @@ Examples:
 
     # Output
     if args.output == "json":
-        import json
         output = {
             "pr_number": args.pr,
             "review": review,
@@ -100,9 +128,73 @@ Examples:
         _post_comment(args.pr, review, args.repo)
 
 
+def _run_agent_mode(args):
+    """Run the multi-file agent review flow."""
+    from agent import run_agent_review
+
+    pr_diff = get_pr_diff(args.pr, args.repo)
+    if not pr_diff.files:
+        print(f"No changes found in PR #{args.pr}", file=sys.stderr)
+        sys.exit(0)
+
+    print(f"PR #{pr_diff.pr_number}: {pr_diff.title}")
+    print(f"Files: {pr_diff.file_count}, +{pr_diff.total_additions} -{pr_diff.total_deletions}")
+    print()
+
+    # Run agent review
+    print("Running agent review...")
+    try:
+        agent_review = run_agent_review(
+            pr_diff,
+            ollama_url=args.ollama_url,
+            model=args.model,
+        )
+    except ConnectionError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Output
+    if args.output == "json":
+        output = {
+            "pr_number": args.pr,
+            **agent_review.to_json_dict(),
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        print(agent_review.to_markdown())
+
+    # Post inline comments if requested
+    if args.inline and args.pr:
+        from github_api import post_inline_review
+        result = post_inline_review(
+            pr_number=args.pr,
+            comments=agent_review.all_comments,
+            body=agent_review.summary,
+            repo_path=args.repo,
+        )
+        if result.success:
+            print(f"\nInline review posted on PR #{args.pr}")
+            if result.review_url:
+                print(f"  {result.review_url}")
+        else:
+            print(f"\nFailed to post inline review: {result.error}", file=sys.stderr)
+            sys.exit(1)
+    elif args.comment and args.pr:
+        # Fall back to single comment
+        _post_comment(args.pr, agent_review.to_markdown(), args.repo)
+
+    # Watch mode: exit non-zero on critical issues
+    if args.watch and agent_review.has_critical:
+        print(
+            f"\nCI check failed: {agent_review.critical_count} critical issue(s) found.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _post_comment(pr_number: int, review: str, repo_path: str):
     """Post review as PR comment."""
-    comment = f"""## 🤖 AI Code Review
+    comment = f"""## AI Code Review
 
 {review}
 
@@ -114,9 +206,9 @@ def _post_comment(pr_number: int, review: str, repo_path: str):
         capture_output=True, text=True, cwd=repo_path
     )
     if result.returncode == 0:
-        print(f"\n✅ Comment posted on PR #{pr_number}")
+        print(f"\nComment posted on PR #{pr_number}")
     else:
-        print(f"\n❌ Failed to post comment: {result.stderr}", file=sys.stderr)
+        print(f"\nFailed to post comment: {result.stderr}", file=sys.stderr)
 
 
 if __name__ == "__main__":
